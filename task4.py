@@ -1,11 +1,13 @@
 ﻿import argparse
 from multiprocessing import Process, Lock
 from ctypes import *
-from multiprocessing.sharedctypes import Value, Array
-from pprint import pprint
-import pickle
+from multiprocessing.sharedctypes import Array as SharedArray,
+Value as SharedValue
 import cmd
 from time import localtime, time, strftime
+from io import BytesIO
+import zlib
+from struct import pack
 
 parser = argparse.ArgumentParser(description=' Copyright (C) Alexander Morgun'
                                  ' <Alexander_Morgun@e1.ru> WTFPL')
@@ -32,7 +34,7 @@ class FileRecord(Structure):
 
 class Segment(Structure):
     _fields_ = [
-        ('data', c_char * segment_len),
+        ('data', c_ubyte * segment_len),
     ]
 
 
@@ -46,7 +48,6 @@ class FileSystem(Structure):
 def get_empty_segment(fs):
     for i in range(n_segments):
         if not fs.file_records[i].used:
-            fs.segments[i].data = b''
             return i
     return -1
 
@@ -64,7 +65,6 @@ def find_file(fs, file):
 def remove_file(fs, file_id):
     if fs.file_records[file_id].used:
         fs.file_records[file_id].used = False
-        fs.segments[file_id].data = b''
         if not fs.file_records[file_id].is_last:
             remove_file(fs, fs.file_records[file_id].next_segment)
 
@@ -91,9 +91,10 @@ def write_bytes_to_file(fs, file_id, to_write):
     while not fs.file_records[seg].is_last:
         seg = fs.file_records[seg].next_segment
     while len(to_write):
-        curr_len = len(fs.segments[seg].data)
-        diff = min(len(to_write), segment_len - curr_len)
-        fs.segments[seg].data += to_write[:diff]
+        offset = fs.file_records[file_id].size % segment_len
+        diff = min(len(to_write), segment_len - offset)
+        for num, b in enumerate(to_write[:diff]):
+            fs.segments[seg].data[offset + num] = b
         fs.file_records[file_id].size += diff
         to_write = to_write[diff:]
         if len(to_write):
@@ -105,7 +106,6 @@ def write_bytes_to_file(fs, file_id, to_write):
             fs.file_records[new_seg].used = True
             fs.file_records[new_seg].is_first = False
             fs.file_records[new_seg].is_last = True
-            fs.segments[new_seg].data = b''
             seg = new_seg
     return 0
 
@@ -128,8 +128,8 @@ def tester(fs, my_number, level, waiting):
 
 if __name__ == '__main__':
 
-    level = Array(c_int, [0 for i in range(n_threads)], lock=False)
-    waiting = Array(c_int, [0 for i in range(n_threads)], lock=False)
+    level = SharedArray(c_int, [0 for i in range(n_threads)], lock=False)
+    waiting = SharedArray(c_int, [0 for i in range(n_threads)], lock=False)
 
     class MyShell(cmd.Cmd):
         intro = 'Welcome to my file system shell. Type help or ? to list commands.\n'
@@ -147,7 +147,8 @@ if __name__ == '__main__':
                         fs.file_records[i].used:
                     name = str(fs.file_records[i].name, 'utf8')
                     print("% 20s % 10s %s" %
-                          (strftime("%d.%m.%Y %H:%M:%S", localtime(fs.file_records[i].last_modified)),
+                          (strftime("%d.%m.%Y %H:%M:%S",
+                                    localtime(fs.file_records[i].last_modified)),
                            fs.file_records[i].size,
                            name))
 
@@ -173,6 +174,46 @@ if __name__ == '__main__':
                 print("Cannot remove %s : No such file" % arg)
             else:
                 remove_file(fs, file)
+
+        def do_export(self, arg):
+            'Export file from file system'
+            if not arg:
+                print('Missing argument')
+                return
+            try:
+                arg = arg[:64]
+                file = find_file(fs, arg)
+                if file == -1:
+                    print("%s : No such file" % arg)
+                else:
+                    file_name = input('Enter destination file:')
+                    f = open(file_name, 'wb')
+                    curr_len = fs.file_records[file].size
+                    while curr_len:
+                        diff = min(curr_len, segment_len)
+                        part = pack('B' * diff, *fs.segments[file].data[:diff])
+                        f.write(part)
+                        file = fs.file_records[file].next_segment
+                        curr_len -= diff
+                    f.close()
+            except Exception as e:
+                print(e)
+
+        def do_import(self, arg):
+            'Import external file to file system. Sample: import C:\WINDOWS\explorer.exe'
+            if not arg:
+                print('Missing argument')
+                return
+            try:
+                f = open(arg, 'rb')
+                file_name = input('Enter name of file in file system:')[:64]
+                file = create_file(fs, file_name)
+                if file == -1:
+                    file = create_file(fs, file_name)
+                write_bytes_to_file(fs, file, f.read())
+                f.close()
+            except Exception as e:
+                print(e)
 
         def do_cat(self, arg):
             'Print file on the standard output'
@@ -204,7 +245,8 @@ if __name__ == '__main__':
                     curr_len = fs.file_records[i_file].size
                     while curr_len:
                         diff = min(curr_len, segment_len)
-                        data += fs.segments[i_file].data[:diff]
+                        data += pack(
+                            'B' * diff, *fs.segments[i_file].data[:diff])
                         i_file = fs.file_records[i_file].next_segment
                         curr_len -= diff
             else:
@@ -230,32 +272,31 @@ if __name__ == '__main__':
             for i in p:
                 i.join()
 
-    fs = Value(FileSystem, lock=False)
-    if not args.n:
-        f = open(args.file, 'rb')
-        tmp = pickle.load(f)
-        f.close()
-        for i in range(n_segments):
-            [fs.file_records[i].used,
-             fs.file_records[i].name,
-             fs.file_records[i].is_first,
-             fs.file_records[i].last_modified,
-             fs.file_records[i].is_last,
-             fs.file_records[i].next_segment,
-             fs.file_records[i].size,
-             fs.segments[i].data] = tmp[i]
+    fs = SharedValue(FileSystem, lock=False)
+    f = open(args.file, 'rb')
+    bytes_all = f.read()
+    if args.n:
+        img_bytes = bytes_all
+    else:
+        data_len = bytes_all[-sizeof(c_size_t):]
+        fs_size = int.from_bytes(
+            data_len, byteorder='little', signed=False) + sizeof(c_size_t)
+        img_bytes = bytes_all[:-fs_size]
+        fs_bytes = zlib.decompress(bytes_all[-fs_size:-sizeof(c_size_t)])
+        fakefile = BytesIO(fs_bytes)
+        fakefile.readinto(fs)
+    f.close()
     try:
         MyShell().cmdloop()
     except:
         pass
 
     f = open(args.file, 'wb')
-    pickle.dump([[fs.file_records[i].used,
-                  fs.file_records[i].name,
-                  fs.file_records[i].is_first,
-                  fs.file_records[i].last_modified,
-                  fs.file_records[i].is_last,
-                  fs.file_records[i].next_segment,
-                  fs.file_records[i].size,
-                  fs.segments[i].data,
-                  ] for i in range(n_segments)], f)
+    f.write(img_bytes)
+    fakefile = BytesIO()
+    fakefile.write(fs)
+    fs_bytes = zlib.compress(fakefile.getvalue())
+    f.write(fs_bytes)
+    fakefile = BytesIO()
+    fakefile.write(c_size_t(len(fs_bytes)))
+    f.write(c_size_t(len(fs_bytes)))
